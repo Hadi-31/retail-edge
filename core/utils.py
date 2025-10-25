@@ -1,25 +1,33 @@
-import cv2, numpy as np, time
+import os, datetime, numpy as np
 
-def now_s():
-    return time.time()
+AGE_MIDS  = np.array([1, 5, 10, 18, 28, 40.5, 50.5, 65], dtype=np.float32)
 
-def draw_box(img, box, color=(0,255,0), thickness=2, label=None):
-    x1,y1,x2,y2 = map(int, box)
-    cv2.rectangle(img, (x1,y1), (x2,y2), color, thickness)
-    if label:
-        cv2.putText(img, label, (x1, max(8, y1-6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+def must_exist(path, label):
+    if not os.path.isfile(path):
+        print(f"[!] Missing {label}: {path}")
+        return False
+    return True
 
-def iou(a, b):
-    ax1, ay1, ax2, ay2 = a
-    bx1, by1, bx2, by2 = b
-    inter_x1 = max(ax1, bx1)
-    inter_y1 = max(ay1, by1)
-    inter_x2 = min(ax2, bx2)
-    inter_y2 = min(ay2, by2)
-    iw = max(0, inter_x2 - inter_x1)
-    ih = max(0, inter_y2 - inter_y1)
-    inter = iw * ih
-    if inter <= 0: return 0.0
-    area_a = max(0, (ax2-ax1)) * max(0, (ay2-ay1))
-    area_b = max(0, (bx2-bx1)) * max(0, (by2-by1))
-    return inter / float(area_a + area_b - inter + 1e-6)
+def age_expected_value(age_logits):
+    p = age_logits.flatten()
+    p = np.exp(p - p.max()); p = p / max(p.sum(), 1e-8)
+    return float((p * AGE_MIDS).sum())
+
+def rect_to_xywh(r):
+    x, y = r.left(), r.top()
+    w, h = r.right() - r.left(), r.bottom() - r.top()
+    return x, y, w, h
+
+def clip_roi(img, x, y, w, h, pad=0.2):
+    H, W = img.shape[:2]
+    px, py = int(w*pad), int(h*pad)
+    x0 = max(0, x - px)
+    y0 = max(0, y - py)
+    x1 = min(W, x + w + px)
+    y1 = min(H, y + h + py)
+    if x1 <= x0 or y1 <= y0:
+        return None, (x, y, w, h)
+    return img[y0:y1, x0:x1], (x0, y0, x1-x0, y1-y0)
+
+def ts_now():
+    return datetime.datetime.now().strftime('%H:%M:%S')

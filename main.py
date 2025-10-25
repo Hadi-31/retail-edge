@@ -1,368 +1,206 @@
-import os, cv2, argparse, time, numpy as np
-import dlib
-from apps.person_detect import PersonDetector
-from core.tracking import IOUTracker
-from core.heatmap_tracker import HeatmapTracker
-from core.fusion import fuse
-from core.ad_engine import AdEngine
+import os, sys, time, platform, argparse, numpy as np, cv2, dlib
+from core.ad_player import AdPlayer
+from core.heatmap import Heatmap
+from core.utils import (
+    must_exist, age_expected_value, clip_roi, rect_to_xywh, ts_now,
+)
 
-# ========= Environment / Config =========
-FSKIP            = int(os.getenv("FRAME_SKIP", "0"))
-MIN_SCORE        = float(os.getenv("MIN_SCORE", "0.30"))
-DWELL_THRESH     = float(os.getenv("DWELL_THRESH", "5"))
-HOT_THRESH       = float(os.getenv("HOT_THRESH", "10"))
-HEAT_OUT_DIR     = os.getenv("HEAT_OUT_DIR", "heatmap_reports")
-DRAW_BOXES       = os.getenv("DRAW_BOXES", "1") == "1"
+# ----------------- CONFIG: paths (env overrides allowed) -----------------
+GENDER_PROTOTXT = os.getenv('GENDER_PROTOTXT', 'mods/gender_deploy.prototxt')
+GENDER_CAFFE    = os.getenv('GENDER_MODEL',    'mods/gender_net.caffemodel')
+AGE_PROTOTXT    = os.getenv('AGE_PROTOTXT',    'mods/age_deploy.prototxt')
+AGE_CAFFE       = os.getenv('AGE_MODEL',       'mods/age_net.caffemodel')
 
-# OpenCV DNN age/gender model paths (Caffe)
-GENDER_PROTOTXT  = os.getenv("GENDER_PROTOTXT", "models/gender_deploy.prototxt")
-GENDER_CAFFE     = os.getenv("GENDER_MODEL",    "models/gender_net.caffemodel")
-AGE_PROTOTXT     = os.getenv("AGE_PROTOTXT",    "models/age_deploy.prototxt")
-AGE_CAFFE        = os.getenv("AGE_MODEL",       "models/age_net.caffemodel")
+# Example videos (make sure they exist)
+VIDEO_KIDS_M   = os.getenv('VIDEO_KIDS_M',  'videos/kids_male_video.mp4')
+VIDEO_KIDS_F   = os.getenv('VIDEO_KIDS_F',  'videos/kids_female_video.mp4')
+VIDEO_ADULT_M  = os.getenv('VIDEO_ADULT_M', 'videos/adult_male_video.mp4')
+VIDEO_ADULT_F  = os.getenv('VIDEO_ADULT_F', 'videos/adult_female_video.mp4')
 
-# Decision window & thresholds
-WINDOW_SEC       = float(os.getenv("WINDOW_SEC", "3.0"))      # seconds between demographic decisions
-EMA_ALPHA        = float(os.getenv("EMA_ALPHA", "0.6"))       # age smoothing
-GENDER_CONF_THR  = float(os.getenv("GENDER_CONF_THR", "0.90"))
-
-# Age-bin midpoints used for expected-value age (tune to your model bins)
-AGE_MIDS = np.array([1, 5, 10, 18, 28, 40.5, 50.5, 65], dtype=np.float32)
-
-
-# ========= Helpers =========
-def must_exist(path, label):
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"[retail-edge] Missing {label}: {path}")
-
-def softmax(x):
-    x = x.astype(np.float32)
-    x = x - np.max(x)
-    e = np.exp(x)
-    return e / np.sum(e)
-
-def age_expected_value(logits_or_probs, mids=AGE_MIDS):
-    """
-    Accepts raw logits OR probabilities. If they don't sum ~1, we softmax.
-    Returns expected age = sum(p_i * mid_i).
-    """
-    vec = np.array(logits_or_probs, dtype=np.float32).flatten()
-    p = vec / (np.sum(vec) + 1e-8)
-    if not (0.99 <= p.sum() <= 1.01):
-        p = softmax(vec)
-    return float(np.dot(p, mids))
-
-def clip_roi(x, y, w, h, W, H):
-    x = max(0, x); y = max(0, y)
-    w = max(1, min(w, W - x))
-    h = max(1, min(h, H - y))
-    return x, y, w, h
-
-
-class AdPlayer:
-    """Non-blocking video/image player. Call step() each loop; shows frames without blocking capture."""
-    def __init__(self, win_name="video"):
-        self.win = win_name
-        self.cap = None
-        self.is_image = False
-        self.stopped = True
-        self.static_frame = None
-
-    def start(self, path):
-        self.stop()
-        if not path or not os.path.exists(path):
-            print(f"[retail-edge] Ad not found: {path}")
-            return False
-
-        # Try open as video
-        cap = cv2.VideoCapture(path)
-        ok, frame = cap.read()
-        if ok and frame is not None:
-            # It is a video; keep cap open and rewind
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            self.cap = cap
-            self.is_image = False
-            self.stopped = False
-            print(f"[retail-edge] Playing ad (video): {path}")
-            return True
-
-        # Fallback as image
-        cap.release()
-        img = cv2.imread(path)
-        if img is not None:
-            self.static_frame = img
-            self.is_image = True
-            self.stopped = False
-            print(f"[retail-edge] Showing ad (image): {path}")
-            return True
-
-        print(f"[retail-edge] Failed to play ad: {path}")
-        return False
-
-    def step(self):
-        """Advance and display one frame. Returns False if finished or stopped."""
-        if self.stopped:
-            return False
-
-        if self.is_image:
-            cv2.imshow(self.win, self.static_frame)
-            # keep image up; don't auto-stop
-            return True
-
-        # video mode
-        ok, frame = self.cap.read()
-        if not ok or frame is None:
-            self.stop()
-            return False
-        cv2.imshow(self.win, frame)
-        return True
-
-    def stop(self):
-        if self.cap is not None:
-            try:
-                self.cap.release()
-            except:
-                pass
-        self.cap = None
-        self.static_frame = None
-        self.stopped = True
-        self.is_image = False
-        try:
-            cv2.destroyWindow(self.win)
-        except:
-            pass
-
-    def active(self):
-        return not self.stopped
-
+# Thresholds & constants
+GENDER_CONF_THR = float(os.getenv('GENDER_CONF_THR', '0.90'))
+EMA_ALPHA       = float(os.getenv('EMA_ALPHA', '0.6'))
+WINDOW_SEC      = float(os.getenv('WINDOW_SEC', '3.0'))
 
 def parse_args():
-    ap = argparse.ArgumentParser("retail-edge: tracking + demographics + ads + heatmap")
-    ap.add_argument("--source", type=str, default="0", help="webcam index or video file")
-    ap.add_argument("--no-display", action="store_true", help="run headless")
-    ap.add_argument("--videos-dir", type=str, default="ui/assets/ads", help="ad assets directory")
-    # Keep --interval/--kids-age for backward compat, but WINDOW_SEC/personas.yaml drive behavior now
-    ap.add_argument("--interval", type=float, default=WINDOW_SEC, help="(deprecated) seconds between decisions")
-    ap.add_argument("--kids-age", type=int, default=12, help="(deprecated) threshold; personas.yaml is preferred")
+    ap = argparse.ArgumentParser("Retail demo: face attrs + ads + heatmap (modular)")
+    ap.add_argument("--source", type=str, default="0", help="webcam index or video path")
+    ap.add_argument("--heatmap-dir", type=str, default=os.getenv("HEATMAP_DIR", "heatmap_reports"),
+                    help="output folder for heatmap PNG/JSON")
+    ap.add_argument("--cam-id", type=str, default="cam0", help="camera id used in filenames")
     return ap.parse_args()
-
 
 def main():
     args = parse_args()
-    src = int(args.source) if args.source.isdigit() else args.source
-    cam_id = str(args.source)
 
-    # Validate DNN model files (we run age/gender here to access logits)
-    try:
-        must_exist(GENDER_PROTOTXT, "GENDER_PROTOTXT")
-        must_exist(GENDER_CAFFE,   "GENDER_MODEL")
-        must_exist(AGE_PROTOTXT,   "AGE_PROTOTXT")
-        must_exist(AGE_CAFFE,      "AGE_MODEL")
-    except FileNotFoundError as e:
-        print(e)
-        print("[retail-edge] Continuing without age/gender (overlays still run, ads may default).")
-        # We will set nets to None below.
+    # Check model files
+    ok = True
+    ok &= must_exist(GENDER_PROTOTXT, 'GENDER_PROTOTXT')
+    ok &= must_exist(GENDER_CAFFE,    'GENDER_CAFFE')
+    ok &= must_exist(AGE_PROTOTXT,    'AGE_PROTOTXT')
+    ok &= must_exist(AGE_CAFFE,       'AGE_CAFFE')
+    if not ok:
+        print("[X] Fix missing model files above and rerun.")
+        sys.exit(1)
 
-    # Load nets (if available)
-    gender_net = None
-    age_net = None
+    # Load models
     try:
         gender_net = cv2.dnn.readNetFromCaffe(GENDER_PROTOTXT, GENDER_CAFFE)
         age_net    = cv2.dnn.readNetFromCaffe(AGE_PROTOTXT,    AGE_CAFFE)
     except Exception as e:
-        print(f"[retail-edge] Failed to load age/gender nets: {e}")
-        gender_net, age_net = None, None
+        print("[X] Failed to load Caffe models:", e)
+        sys.exit(1)
 
-    # Dlib face detector (landmarks not required)
-    face_det = dlib.get_frontal_face_detector()
-
-    det  = PersonDetector()
-    trk  = IOUTracker(iou_thresh=0.4, max_age=30)
-    adeng= AdEngine()
-
-    cap = cv2.VideoCapture(src)
-    if not cap.isOpened():
-        print(f"[retail-edge] Failed to open source: {args.source}")
-        return
-
-    ok, f0 = cap.read()
-    if not ok or f0 is None:
-        print("[retail-edge] No frames available.")
-        return
-
-    heat = HeatmapTracker(f0.shape, cam_id=cam_id, dwell_thresh=DWELL_THRESH, hot_thresh=HOT_THRESH, out_dir=HEAT_OUT_DIR)
+    # Face detector
     try:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-    except:
-        pass
+        detector = dlib.get_frontal_face_detector()
+    except Exception as e:
+        print("[X] Dlib face detector failed to initialize:", e)
+        sys.exit(1)
 
-    # decision window accumulators
-    totals = {"faces": 0, "age_sum": 0.0, "male": 0, "female": 0}
-    age_ema = None  # smoothed age preview
-    window_start_ts = time.time()
+    # Open source
+    src = args.source
+    if src.isdigit():
+        cap_flag = cv2.CAP_DSHOW if platform.system() == 'Windows' else 0
+        cap = cv2.VideoCapture(int(src), cap_flag) if platform.system() == 'Windows' else cv2.VideoCapture(int(src))
+    else:
+        cap = cv2.VideoCapture(src)
 
-    frame_index = 0
-    cam_win = "camera"
-    ad = AdPlayer(win_name="video")
+    if not cap.isOpened():
+        print(f"[X] Could not open source: {src}")
+        sys.exit(1)
+
+    cv2.namedWindow('camera', cv2.WINDOW_NORMAL)
+
+    # Modules
+    ad   = AdPlayer(win='video')
+    heat = Heatmap(alpha=float(os.getenv('HEAT_ALPHA', '0.45')))
+
+    # Stats for decisioning
+    ema_age = None
+    total_faces = 0
+    total_age = 0.0
+    total_male = 0
+    total_female = 0
+    window_start = time.time()
+
+    print("[✓] Running. Keys: 'q' quit | 'c' cancel ad | 'h' toggle heatmap | 'r' reset heatmap | 's' save now")
 
     while True:
         ok, frame = cap.read()
-        if not ok or frame is None:
+        if not ok:
+            if src.isdigit():  # camera: retry
+                time.sleep(0.02)
+                continue
+            print("[i] End of file / no more frames.")
             break
 
-        # frame skip
-        if FSKIP and (frame_index % (FSKIP + 1) != 0):
-            frame_index += 1
-            # show frames minimally so UI stays responsive
-            if not args.no_display:
-                cv2.imshow(cam_win, frame)
-                if ad.active():
-                    ad.step()  # keep ad flowing
-                key = cv2.waitKey(1) & 0xFF
-                if key in (27, ord('q')): break
-                if key in (ord('c'),): ad.stop()
-            continue
-
-        # ----- Person detection / tracking / heatmap -----
-        dets = det.infer(frame) or []
-        dets = [d for d in dets if d.get('conf', 1.0) >= MIN_SCORE]
-        tracks = trk.update(dets)
-        heat.update(frame, tracks)
-
-        # ----- Face detect + age/gender (EV + confidence) -----
         H, W = frame.shape[:2]
+        heat.ensure((H, W))
+        heat.decay()
+
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        rects = face_det(gray, 0)
+        rects = detector(gray, 0)
 
-        faces_for_fusion = []
         for r in rects:
-            x, y, w, h = r.left(), r.top(), r.width(), r.height()
-            x, y, w, h = clip_roi(x, y, w, h, W, H)
-            x1, y1, x2, y2 = x, y, x + w, y + h
-            sub = frame[y1:y2, x1:x2]
-            age_ev, gender_lbl, gender_conf = None, None, None
+            x, y, w, h = rect_to_xywh(r)
+            if w <= 0 or h <= 0:
+                continue
 
-            if sub.size > 0 and (gender_net is not None and age_net is not None):
-                blob = cv2.dnn.blobFromImage(
-                    sub, 1.0, (227, 227),
-                    (78.4263377603, 87.7689143744, 114.895847746),
-                    swapRB=False
-                )
-                # gender
-                gender_net.setInput(blob)
-                g = gender_net.forward()[0]  # logits or probs [Male, Female]
-                gp = softmax(g)
-                if gp[0] >= gp[1]:
-                    gender_lbl = "Male"
-                    gender_conf = float(gp[0])
-                else:
-                    gender_lbl = "Female"
-                    gender_conf = float(gp[1])
-                # age
-                age_net.setInput(blob)
-                a = age_net.forward()[0]  # 8-way logits or probs
-                age_ev = age_expected_value(a, AGE_MIDS)
+            # Heat contribution
+            heat.add_face(frame.shape, x, y, w, h)
 
-            # apply gender confidence threshold
-            if gender_conf is not None and gender_conf < GENDER_CONF_THR:
-                gender_lbl = "unsure"
+            # Model input (padded crop)
+            face_roi, (fx, fy, fw, fh) = clip_roi(frame, x, y, w, h, pad=0.20)
+            if face_roi is None or face_roi.size == 0:
+                continue
 
-            # EMA smoothing for age (global preview)
-            if age_ev is not None:
-                age_ema = age_ev if age_ema is None else (EMA_ALPHA * age_ev + (1 - EMA_ALPHA) * age_ema)
+            blob = cv2.dnn.blobFromImage(
+                face_roi, 1.0, (227, 227),
+                (78.4263377603, 87.7689143744, 114.895847746),
+                swapRB=False, crop=False
+            )
 
-            # Add to fusion list
-            faces_for_fusion.append({
-                "box": (x1, y1, x2, y2),
-                "age": int(round(age_ev)) if age_ev is not None else None,
-                "gender": gender_lbl,
-                "emotion": None
-            })
+            # Gender
+            gender_net.setInput(blob)
+            g = gender_net.forward()[0]
+            g_idx = int(np.argmax(g))
+            g_conf = float(g[g_idx])
+            gender = 'Male' if g_idx == 0 else 'Female'
 
-        # Fuse faces to tracks (ID-aware overlay)
-        enriched = fuse(tracks, faces_for_fusion)
+            # Age (expected value with EMA)
+            age_net.setInput(blob)
+            a = age_net.forward()[0]
+            age_ev = age_expected_value(a)
+            ema_age = age_ev if ema_age is None else (EMA_ALPHA*age_ev + (1-EMA_ALPHA)*ema_age)
 
-        # update window totals for decisioning
-        for f in faces_for_fusion:
-            g = (f.get("gender") or "").lower()
-            if g == "male": totals["male"] += 1
-            elif g == "female": totals["female"] += 1
-            if f.get("age") is not None: totals["age_sum"] += float(f["age"])
-            totals["faces"] += 1
+            # Overlay
+            cv2.rectangle(frame, (fy and fx), (fx+fw, fy+fh), (0,255,0), 2)  # (x,y) → (fx,fy)
+            cv2.rectangle(frame, (fx, fy), (fx+fw, fy+fh), (0,255,0), 2)
+            g_text = gender if g_conf >= GENDER_CONF_THR else "Gender: unsure"
+            a_text = f"Age≈ {int(round(ema_age))}"
+            cv2.putText(frame, g_text, (fx, max(0, fy-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+            cv2.putText(frame, a_text, (fx, fy+fh+22),        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
 
-        # ----- Render heatmap overlay -----
-        overlay = heat.render(frame)
+            # Stats
+            total_faces += 1
+            total_age += age_ev
+            if g_conf >= GENDER_CONF_THR:
+                if gender == 'Male': total_male += 1
+                else:                total_female += 1
 
-        # ----- Decision window (only when NO ad is running) -----
-        now = time.time()
-        window_elapsed = (now - window_start_ts) >= WINDOW_SEC
-        if (not ad.active()) and window_elapsed:
-            if totals["faces"] > 0:
-                avg_age = totals["age_sum"] / totals["faces"]
-                frac_male = totals["male"] / max(1, totals["faces"])
-                ad_path = adeng.choose(avg_age, frac_male)  # personas.yaml mapping
-                if ad_path:
-                    ad.start(ad_path)
-                print(f"[retail-edge] Decision @ {time.strftime('%H:%M:%S')}: "
-                      f"avg_age={avg_age:.1f} (EMA={age_ema:.1f} if set) male%={frac_male*100:.1f} -> {ad_path}")
-            # reset window
-            totals = {"faces": 0, "age_sum": 0.0, "male": 0, "female": 0}
-            window_start_ts = now
+        # Render heatmap overlay
+        frame_show = heat.overlay(frame)
+        cv2.imshow('camera', frame_show)
 
-        # ----- Display -----
-        if not args.no_display:
-            vis = overlay.copy()
+        # Non-blocking ad
+        if ad.active():
+            ad_frame = ad.step()
+            if ad_frame is not None:
+                cv2.imshow('video', ad_frame)
+        else:
+            if (time.time() - window_start) > WINDOW_SEC:
+                if total_faces > 0:
+                    avg_age = total_age / total_faces
+                    votes = total_male + total_female
+                    male_ratio = (total_male / votes) if votes > 0 else 0.5
 
-            # Draw enriched tracks
-            for t in enriched:
-                x1, y1, x2, y2 = map(int, t['box'])
-                cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                label = f"ID {t['id']}"
-                g = t.get('gender')
-                a = t.get('age')
-                if g or a:
-                    label += f" | {(g if g else '?')} {(a if a is not None else '')}"
-                cv2.putText(vis, label, (x1, max(8, y1 - 6)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+                    if avg_age <= 12:
+                        path = VIDEO_KIDS_M if male_ratio >= 0.5 else VIDEO_KIDS_F
+                    else:
+                        path = VIDEO_ADULT_M if male_ratio >= 0.5 else VIDEO_ADULT_F
 
-            # HUD with EMA age
-            if age_ema is not None:
-                txt = f"Age(EMA): {age_ema:.1f}"
-                cv2.putText(vis, txt, (10, 24),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (50, 220, 255), 2, cv2.LINE_AA)
+                    print(f"[i] {ts_now()} starting ad: {path}")
+                    ad.start(path)
 
-            cv2.imshow(cam_win, vis)
+                # reset stats
+                total_faces = total_male = total_female = 0
+                total_age = 0.0
+                window_start = time.time()
 
-            # Step ad window (non-blocking)
-            if ad.active():
-                ad.step()
+        # Keys
+        k = cv2.waitKey(1) & 0xFF
+        if k == ord('q'):
+            break
+        elif k == ord('c'):
+            ad.stop()
+        elif k == ord('h'):
+            heat.enabled = not heat.enabled
+            print(f"[i] Heatmap {'ON' if heat.enabled else 'OFF'}")
+        elif k == ord('r'):
+            heat.reset()
+            print("[i] Heatmap reset.")
+        elif k == ord('s'):
+            heat.save(args.heatmap_dir, cam_id=args.cam_id)
 
-            key = cv2.waitKey(1) & 0xFF
-            if key in (27, ord('q')):  # Esc or q
-                break
-            if key in (ord('c'),):     # cancel ad
-                ad.stop()
-
-        frame_index += 1
-
-    # ----- Save heatmap outputs -----
-    try:
-        report_path = heat.save_report()
-        hm = heat.heatmap.copy()
-        hm_norm = cv2.normalize(hm, None, 0, 255, cv2.NORM_MINMAX).astype('uint8')
-        hm_color = cv2.applyColorMap(hm_norm, cv2.COLORMAP_JET)
-        out_png = os.path.join(HEAT_OUT_DIR, f"{cam_id}_heatmap.png")
-        cv2.imwrite(out_png, hm_color)
-        print(f"[retail-edge] Saved report: {report_path}")
-        print(f"[retail-edge] Saved heatmap: {out_png}")
-    except Exception as e:
-        print(f"[retail-edge] Failed to save report: {e}")
-
-    # Cleanup
+    # Cleanup & auto-save
     ad.stop()
     cap.release()
-    if not args.no_display:
-        cv2.destroyAllWindows()
-
+    if heat.acc is not None:
+        print("[i] Saving final heatmap…")
+        heat.save(args.heatmap_dir, cam_id=args.cam_id)
+    cv2.destroyAllWindows()
+    print("[✓] Clean exit.")
 
 if __name__ == "__main__":
     main()

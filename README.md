@@ -2,7 +2,7 @@
 
 Lightweight, edge-ready **retail analytics and ad targeting system**.  
 Detects faces, estimates **age** and **gender**, plays **targeted ads**, and builds a **real-time heatmap** of customer attention.  
-All modules are self-contained and built with **OpenCV** and **dlib**, optimized for real-time edge devices like Jetson or Raspberry Pi.
+All modules are self-contained and built with **OpenCV** and **dlib**, optimized for real-time edge devices like MemoryX .
 
 ---
 
